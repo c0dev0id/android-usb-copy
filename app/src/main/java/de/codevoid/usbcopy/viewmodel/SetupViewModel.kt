@@ -7,6 +7,7 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import de.codevoid.usbcopy.data.PreferencesRepository
+import de.codevoid.usbcopy.data.extractDeviceId
 import de.codevoid.usbcopy.model.ErrorStrategy
 import de.codevoid.usbcopy.model.OverwriteStrategy
 import de.codevoid.usbcopy.model.SourceFolder
@@ -50,8 +51,7 @@ class SetupViewModel(app: Application) : AndroidViewModel(app) {
 
             val doc = DocumentFile.fromTreeUri(getApplication(), uri)
             val name = doc?.name ?: uri.lastPathSegment ?: uri.toString()
-            val deviceId = uri.lastPathSegment?.substringBefore(':')
-                ?.takeIf { it.isNotBlank() } ?: name
+            val deviceId = uri.extractDeviceId(name)
 
             val current = uiState.value.sources.toMutableList()
             if (current.none { it.uri == uri }) {

@@ -1,5 +1,6 @@
 package de.codevoid.usbcopy.ui.components
 
+import android.text.format.Formatter
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -9,8 +10,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import de.codevoid.usbcopy.model.FileEvent
@@ -18,15 +22,26 @@ import de.codevoid.usbcopy.model.FileEvent
 @Composable
 fun FileLogList(events: List<FileEvent>, modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
+    val context = LocalContext.current
+
+    val isPinnedToBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf true
+            last.index >= info.totalItemsCount - 2
+        }
+    }
 
     LaunchedEffect(events.size) {
-        if (events.isNotEmpty()) listState.animateScrollToItem(events.lastIndex)
+        if (events.isNotEmpty() && isPinnedToBottom) {
+            listState.animateScrollToItem(events.lastIndex)
+        }
     }
 
     LazyColumn(state = listState, modifier = modifier) {
-        items(events, key = { it.hashCode() }) { event ->
+        items(events) { event ->
             Text(
-                text = formatEvent(event),
+                text = formatEvent(event, context),
                 color = eventColor(event),
                 style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 modifier = Modifier
@@ -37,25 +52,13 @@ fun FileLogList(events: List<FileEvent>, modifier: Modifier = Modifier) {
     }
 }
 
-private fun formatEvent(event: FileEvent): String = when (event) {
-    is FileEvent.Copied -> "✓ ${event.name}  (${event.sizeBytes.toHuman()})"
+private fun formatEvent(event: FileEvent, context: android.content.Context): String = when (event) {
+    is FileEvent.Copied -> "✓ ${event.name}  (${Formatter.formatShortFileSize(context, event.sizeBytes)})"
     is FileEvent.Skipped -> "→ ${event.name}  skipped"
-    is FileEvent.InProgress -> {
-        val pct = if (event.totalBytes > 0) event.bytesWritten * 100 / event.totalBytes else 0
-        "… ${event.name}  $pct%  ${(event.speedBytesPerSec / 1_048_576.0).let { "%.1f MB/s".format(it) }}"
-    }
     is FileEvent.Error -> "✗ ${event.name}  ${event.message}"
 }
 
 private fun eventColor(event: FileEvent): Color = when (event) {
     is FileEvent.Copied, is FileEvent.Skipped -> Color(0xFF2E7D32)
-    is FileEvent.InProgress -> Color(0xFFE65100)
     is FileEvent.Error -> Color(0xFFC62828)
-}
-
-private fun Long.toHuman(): String = when {
-    this >= 1_073_741_824 -> "%.1f GB".format(this / 1_073_741_824.0)
-    this >= 1_048_576 -> "%.1f MB".format(this / 1_048_576.0)
-    this >= 1_024 -> "%.0f KB".format(this / 1_024.0)
-    else -> "${this} B"
 }

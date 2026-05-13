@@ -8,11 +8,14 @@ import android.net.Uri
 import android.os.Binder
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.documentfile.provider.DocumentFile
 import de.codevoid.usbcopy.R
+import de.codevoid.usbcopy.data.extractDeviceId
 import de.codevoid.usbcopy.model.ErrorStrategy
 import de.codevoid.usbcopy.model.OverwriteStrategy
 import de.codevoid.usbcopy.model.TaskState
 import de.codevoid.usbcopy.model.TransferTask
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,6 +28,8 @@ import kotlinx.coroutines.launch
 
 private const val CHANNEL_ID = "transfer"
 private const val NOTIFICATION_ID = 1
+private const val NOTIFICATION_THROTTLE_NS = 1_000_000_000L
+private const val LOG_MAX_ENTRIES = 10_000
 
 class TransferService : Service() {
 
@@ -40,6 +45,7 @@ class TransferService : Service() {
     val tasks: StateFlow<List<TaskState>> = _tasks.asStateFlow()
 
     private var transferJob: Job? = null
+    private var lastNotificationTs = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -50,31 +56,11 @@ class TransferService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification("Starting…"))
-        if (intent != null) {
+        if (intent != null && transferJob == null) {
             val (tasks, sequential) = buildTasks(intent)
             if (tasks.isNotEmpty()) start(tasks, sequential)
         }
         return START_NOT_STICKY
-    }
-
-    fun start(
-        tasks: List<TransferTask>,
-        sequential: Boolean,
-    ) {
-        _tasks.value = tasks.map { TaskState(it) }
-
-        transferJob = scope.launch {
-            precomputeTotals(tasks)
-
-            if (sequential) {
-                for (task in tasks) runTask(task)
-            } else {
-                val jobs = tasks.map { task -> launch { runTask(task) } }
-                jobs.forEach { it.join() }
-            }
-
-            stopSelf()
-        }
     }
 
     fun cancel() {
@@ -88,49 +74,64 @@ class TransferService : Service() {
         }
     }
 
-    private suspend fun precomputeTotals(tasks: List<TransferTask>) {
-        for (task in tasks) {
-            val doc = androidx.documentfile.provider.DocumentFile.fromTreeUri(
-                applicationContext, task.sourceUri
-            ) ?: continue
-            val total = doc.countBytes()
-            _tasks.update { list ->
-                list.map { if (it.task.id == task.id) it.copy(totalBytes = total) else it }
+    private fun start(tasks: List<TransferTask>, sequential: Boolean) {
+        _tasks.value = tasks.map { TaskState(it) }
+
+        transferJob = scope.launch {
+            if (sequential) {
+                for (task in tasks) {
+                    precomputeTotal(task)
+                    runTask(task)
+                }
+            } else {
+                tasks.map { task ->
+                    launch {
+                        precomputeTotal(task)
+                        runTask(task)
+                    }
+                }.forEach { it.join() }
             }
+            stopSelf()
+        }
+    }
+
+    private fun precomputeTotal(task: TransferTask) {
+        val doc = DocumentFile.fromTreeUri(applicationContext, task.sourceUri) ?: return
+        val total = doc.countBytes()
+        _tasks.update { list ->
+            list.map { if (it.task.id == task.id) it.copy(totalBytes = total) else it }
         }
     }
 
     private suspend fun runTask(task: TransferTask) {
         setStatus(task.id, TaskState.Status.RUNNING)
-
         try {
-            val total = _tasks.value.first { it.task.id == task.id }.totalBytes
-
-            engine.execute(task, total).collect { progress ->
-                _tasks.update { list ->
-                    list.map { state ->
-                        if (state.task.id != task.id) return@map state
-                        val newLog = when (val e = progress.event) {
-                            is de.codevoid.usbcopy.model.FileEvent.InProgress ->
-                                state.log.dropLastInProgress() + e
-                            else -> state.log + progress.event
-                        }
-                        state.copy(
-                            bytesCopied = progress.bytesCopied,
-                            currentFile = (progress.event as? de.codevoid.usbcopy.model.FileEvent.InProgress)
-                                ?.name ?: state.currentFile,
-                            speedBytesPerSec = (progress.event as? de.codevoid.usbcopy.model.FileEvent.InProgress)
-                                ?.speedBytesPerSec?.takeIf { it > 0 } ?: state.speedBytesPerSec,
-                            log = newLog,
-                        )
-                    }
-                }
-                updateNotification()
-            }
+            engine.execute(task) { progress -> applyProgress(task.id, progress) }
             setStatus(task.id, TaskState.Status.DONE)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             setStatus(task.id, TaskState.Status.ERROR)
         }
+    }
+
+    private fun applyProgress(taskId: String, progress: TransferEngine.Progress) {
+        _tasks.update { list ->
+            list.map { state ->
+                if (state.task.id != taskId) return@map state
+                val log = if (progress.event != null) {
+                    val appended = state.log + progress.event
+                    if (appended.size > LOG_MAX_ENTRIES) appended.takeLast(LOG_MAX_ENTRIES) else appended
+                } else state.log
+                state.copy(
+                    bytesCopied = state.bytesCopied + progress.bytesDelta,
+                    currentFile = progress.currentFile,
+                    speedBytesPerSec = progress.speedBytesPerSec,
+                    log = log,
+                )
+            }
+        }
+        throttledNotificationUpdate()
     }
 
     private fun setStatus(taskId: String, status: TaskState.Status) {
@@ -139,15 +140,18 @@ class TransferService : Service() {
         }
     }
 
-    private fun updateNotification() {
+    private fun throttledNotificationUpdate() {
+        val now = System.nanoTime()
+        if (now - lastNotificationTs < NOTIFICATION_THROTTLE_NS) return
+        lastNotificationTs = now
+
         val states = _tasks.value
         val done = states.count { it.status == TaskState.Status.DONE }
         val total = states.size
-        val avgProgress = if (states.isEmpty()) 0
+        val avgPct = if (states.isEmpty()) 0
         else (states.sumOf { it.progressFraction.toDouble() } / states.size * 100).toInt()
-        val text = "$done/$total tasks · $avgProgress%"
         val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, buildNotification(text))
+        nm.notify(NOTIFICATION_ID, buildNotification("$done/$total tasks · $avgPct%"))
     }
 
     private fun buildNotification(text: String) =
@@ -175,7 +179,7 @@ class TransferService : Service() {
         const val EXTRA_ERROR = "error"
         const val EXTRA_SEQUENTIAL = "sequential"
 
-        fun buildTasks(intent: Intent): Pair<List<TransferTask>, Boolean> {
+        private fun buildTasks(intent: Intent): Pair<List<TransferTask>, Boolean> {
             val sourceUris = intent.getStringArrayExtra(EXTRA_SOURCES)
                 ?.map { Uri.parse(it) } ?: emptyList()
             val destUri = Uri.parse(intent.getStringExtra(EXTRA_DEST) ?: return Pair(emptyList(), false))
@@ -188,8 +192,7 @@ class TransferService : Service() {
             val sequential = intent.getBooleanExtra(EXTRA_SEQUENTIAL, false)
 
             val tasks = sourceUris.mapIndexed { i, uri ->
-                val deviceId = uri.lastPathSegment?.substringBefore(':')
-                    ?.takeIf { it.isNotBlank() } ?: "device_$i"
+                val deviceId = uri.extractDeviceId("device_$i")
                 TransferTask(
                     id = deviceId,
                     sourceUri = uri,
@@ -202,9 +205,4 @@ class TransferService : Service() {
             return Pair(tasks, sequential)
         }
     }
-}
-
-private fun List<de.codevoid.usbcopy.model.FileEvent>.dropLastInProgress(): List<de.codevoid.usbcopy.model.FileEvent> {
-    if (lastOrNull() is de.codevoid.usbcopy.model.FileEvent.InProgress) return dropLast(1)
-    return this
 }

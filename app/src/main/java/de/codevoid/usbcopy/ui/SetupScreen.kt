@@ -69,7 +69,6 @@ fun SetupScreen(vm: SetupViewModel, onStartTransfer: () -> Unit) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            // Sources
             Text("Source Folders", style = MaterialTheme.typography.titleMedium)
             state.sources.forEach { src ->
                 SourceRow(src, onRemove = { vm.removeSource(src.uri) })
@@ -81,7 +80,6 @@ fun SetupScreen(vm: SetupViewModel, onStartTransfer: () -> Unit) {
 
             HorizontalDivider()
 
-            // Destination
             Text("Destination Folder", style = MaterialTheme.typography.titleMedium)
             val destLabel = state.destination?.lastPathSegment ?: "Not selected"
             OutlinedButton(onClick = { destPicker.launch(null) }, modifier = Modifier.fillMaxWidth()) {
@@ -90,14 +88,13 @@ fun SetupScreen(vm: SetupViewModel, onStartTransfer: () -> Unit) {
 
             HorizontalDivider()
 
-            // Options
             Text("Options", style = MaterialTheme.typography.titleMedium)
 
             EnumDropdown(
                 title = "Overwrite Strategy",
                 selected = state.overwriteStrategy,
                 values = OverwriteStrategy.entries,
-                displayName = { it.name.replace('_', ' ').lowercase().replaceFirstChar { c -> c.uppercase() } },
+                displayName = ::enumLabel,
                 onSelect = vm::setOverwriteStrategy,
             )
 
@@ -105,7 +102,7 @@ fun SetupScreen(vm: SetupViewModel, onStartTransfer: () -> Unit) {
                 title = "On Error",
                 selected = state.errorStrategy,
                 values = ErrorStrategy.entries,
-                displayName = { it.name.replace('_', ' ').lowercase().replaceFirstChar { c -> c.uppercase() } },
+                displayName = ::enumLabel,
                 onSelect = vm::setErrorStrategy,
             )
 
@@ -180,3 +177,6 @@ private fun <T> EnumDropdown(
         }
     }
 }
+
+private fun enumLabel(e: Enum<*>): String =
+    e.name.replace('_', ' ').lowercase().replaceFirstChar { it.uppercase() }

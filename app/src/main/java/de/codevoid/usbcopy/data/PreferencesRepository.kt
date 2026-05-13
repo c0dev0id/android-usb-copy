@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -28,7 +29,7 @@ class PreferencesRepository(private val context: Context) {
         private val KEY_DEST = stringPreferencesKey("dest")
         private val KEY_OVERWRITE = stringPreferencesKey("overwrite")
         private val KEY_ERROR = stringPreferencesKey("error")
-        private val KEY_SEQUENTIAL = stringPreferencesKey("sequential")
+        private val KEY_SEQUENTIAL = booleanPreferencesKey("sequential")
     }
 
     val sourceFolders: Flow<List<SourceFolder>> = context.dataStore.data.map { prefs ->
@@ -43,17 +44,15 @@ class PreferencesRepository(private val context: Context) {
     }
 
     val overwriteStrategy: Flow<OverwriteStrategy> = context.dataStore.data.map { prefs ->
-        prefs[KEY_OVERWRITE]?.let { runCatching { OverwriteStrategy.valueOf(it) }.getOrNull() }
-            ?: OverwriteStrategy.SKIP
+        prefs[KEY_OVERWRITE].toEnumOrDefault(OverwriteStrategy.SKIP)
     }
 
     val errorStrategy: Flow<ErrorStrategy> = context.dataStore.data.map { prefs ->
-        prefs[KEY_ERROR]?.let { runCatching { ErrorStrategy.valueOf(it) }.getOrNull() }
-            ?: ErrorStrategy.SKIP_AND_CONTINUE
+        prefs[KEY_ERROR].toEnumOrDefault(ErrorStrategy.SKIP_AND_CONTINUE)
     }
 
     val sequential: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        prefs[KEY_SEQUENTIAL] == "true"
+        prefs[KEY_SEQUENTIAL] == true
     }
 
     suspend fun saveSourceFolders(folders: List<SourceFolder>) {
@@ -66,20 +65,22 @@ class PreferencesRepository(private val context: Context) {
 
     suspend fun saveDestination(uri: Uri?) {
         context.dataStore.edit { prefs ->
-            if (uri != null) prefs[KEY_DEST] = uri.toString()
-            else prefs.remove(KEY_DEST)
+            if (uri != null) prefs[KEY_DEST] = uri.toString() else prefs.remove(KEY_DEST)
         }
     }
 
     suspend fun saveOverwriteStrategy(strategy: OverwriteStrategy) {
-        context.dataStore.edit { prefs -> prefs[KEY_OVERWRITE] = strategy.name }
+        context.dataStore.edit { it[KEY_OVERWRITE] = strategy.name }
     }
 
     suspend fun saveErrorStrategy(strategy: ErrorStrategy) {
-        context.dataStore.edit { prefs -> prefs[KEY_ERROR] = strategy.name }
+        context.dataStore.edit { it[KEY_ERROR] = strategy.name }
     }
 
     suspend fun saveSequential(sequential: Boolean) {
-        context.dataStore.edit { prefs -> prefs[KEY_SEQUENTIAL] = sequential.toString() }
+        context.dataStore.edit { it[KEY_SEQUENTIAL] = sequential }
     }
 }
+
+private inline fun <reified E : Enum<E>> String?.toEnumOrDefault(default: E): E =
+    this?.let { runCatching { enumValueOf<E>(it) }.getOrNull() } ?: default

@@ -1,64 +1,50 @@
 package de.codevoid.usbcopy.service
 
 import android.content.Context
-import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import de.codevoid.usbcopy.model.ErrorStrategy
 import de.codevoid.usbcopy.model.FileEvent
 import de.codevoid.usbcopy.model.OverwriteStrategy
 import de.codevoid.usbcopy.model.TransferTask
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
+import java.io.IOException
 
 private const val BUFFER_SIZE = 65_536
+private const val SAMPLE_INTERVAL_NS = 500_000_000L
 
 class TransferEngine(private val context: Context) {
-    private val resolver get() = context.contentResolver
 
     data class Progress(
-        val bytesCopied: Long,
-        val totalBytes: Long,
-        val event: FileEvent,
+        val bytesDelta: Long,
+        val currentFile: String,
+        val speedBytesPerSec: Long,
+        val event: FileEvent? = null,
     )
 
-    fun execute(task: TransferTask, totalBytes: Long): Flow<Progress> = flow {
+    suspend fun execute(task: TransferTask, onProgress: suspend (Progress) -> Unit) {
         val sourceDir = DocumentFile.fromTreeUri(context, task.sourceUri)
-            ?: error("Cannot open source URI")
+            ?: throw IOException("Cannot open source URI")
         val destRoot = DocumentFile.fromTreeUri(context, task.destRootUri)
-            ?: error("Cannot open destination URI")
+            ?: throw IOException("Cannot open destination URI")
 
         val destDir = destRoot.findOrCreate(task.deviceId)
-        var bytesCopied = 0L
-
-        copyDir(
-            sourceDir = sourceDir,
-            destDir = destDir,
-            task = task,
-            totalBytes = totalBytes,
-            bytesCopied = { bytesCopied },
-            onProgress = { delta, event ->
-                bytesCopied += delta
-                emit(Progress(bytesCopied, totalBytes, event))
-            },
-        )
+        copyDir(sourceDir, destDir, task, onProgress)
     }
 
     private suspend fun copyDir(
         sourceDir: DocumentFile,
         destDir: DocumentFile,
         task: TransferTask,
-        totalBytes: Long,
-        bytesCopied: () -> Long,
-        onProgress: suspend (delta: Long, event: FileEvent) -> Unit,
+        onProgress: suspend (Progress) -> Unit,
     ) {
         for (source in sourceDir.listFiles()) {
             if (!currentCoroutineContext().isActive) return
 
             if (source.isDirectory) {
                 val subDest = destDir.findOrCreate(source.name ?: continue)
-                copyDir(source, subDest, task, totalBytes, bytesCopied, onProgress)
+                copyDir(source, subDest, task, onProgress)
             } else {
                 copyFile(source, destDir, task, onProgress)
             }
@@ -69,7 +55,7 @@ class TransferEngine(private val context: Context) {
         source: DocumentFile,
         destDir: DocumentFile,
         task: TransferTask,
-        onProgress: suspend (delta: Long, event: FileEvent) -> Unit,
+        onProgress: suspend (Progress) -> Unit,
     ) {
         val name = source.name ?: return
         val sourceSize = source.length()
@@ -82,58 +68,55 @@ class TransferEngine(private val context: Context) {
         }
 
         if (skip) {
-            onProgress(sourceSize, FileEvent.Skipped(name, sourceSize))
+            onProgress(Progress(sourceSize, name, 0L, FileEvent.Skipped(name, sourceSize)))
             return
         }
 
         val destFile = existing ?: destDir.createFile("application/octet-stream", name)
         if (destFile == null) {
-            onProgress(0, FileEvent.Error(name, "Could not create destination file"))
-            if (task.errorStrategy == ErrorStrategy.STOP) throw RuntimeException("Error on $name")
+            onProgress(Progress(0, name, 0L, FileEvent.Error(name, "Cannot create destination")))
+            if (task.errorStrategy == ErrorStrategy.STOP) throw IOException("Cannot create $name")
             return
         }
 
+        val resolver = context.contentResolver
         try {
-            resolver.openInputStream(source.uri)!!.use { input ->
-                resolver.openOutputStream(destFile.uri, "wt")!!.use { output ->
+            (resolver.openInputStream(source.uri) ?: throw IOException("Cannot open $name")).use { src ->
+                (resolver.openOutputStream(destFile.uri, "wt") ?: throw IOException("Cannot write $name")).use { dst ->
                     val buf = ByteArray(BUFFER_SIZE)
-                    var written = 0L
-                    var lastSpeedTs = System.nanoTime()
-                    var bytesSinceLastTs = 0L
+                    var bytesSinceLastEmit = 0L
+                    var lastEmitTs = System.nanoTime()
 
                     while (true) {
                         if (!currentCoroutineContext().isActive) return
-                        val read = input.read(buf)
+                        val read = src.read(buf)
                         if (read == -1) break
-                        output.write(buf, 0, read)
-                        written += read
-                        bytesSinceLastTs += read
+                        dst.write(buf, 0, read)
+                        bytesSinceLastEmit += read
 
                         val now = System.nanoTime()
-                        val elapsedNs = now - lastSpeedTs
-                        if (elapsedNs >= 500_000_000L) {
-                            val speed = bytesSinceLastTs * 1_000_000_000L / elapsedNs
-                            onProgress(
-                                read.toLong(),
-                                FileEvent.InProgress(name, written, sourceSize, speed),
-                            )
-                            lastSpeedTs = now
-                            bytesSinceLastTs = 0L
-                        } else {
-                            onProgress(read.toLong(), FileEvent.InProgress(name, written, sourceSize, 0L))
+                        val elapsedNs = now - lastEmitTs
+                        if (elapsedNs >= SAMPLE_INTERVAL_NS) {
+                            val speed = bytesSinceLastEmit * 1_000_000_000L / elapsedNs
+                            onProgress(Progress(bytesSinceLastEmit, name, speed))
+                            bytesSinceLastEmit = 0L
+                            lastEmitTs = now
                         }
                     }
+
+                    onProgress(Progress(bytesSinceLastEmit, name, 0L, FileEvent.Copied(name, sourceSize)))
                 }
             }
-            onProgress(0, FileEvent.Copied(name, sourceSize))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            onProgress(0, FileEvent.Error(name, e.message ?: "Unknown error"))
+            onProgress(Progress(0, name, 0L, FileEvent.Error(name, e.message ?: "Unknown error")))
             if (task.errorStrategy == ErrorStrategy.STOP) throw e
         }
     }
 
     private fun DocumentFile.findOrCreate(name: String): DocumentFile =
-        findFile(name) ?: createDirectory(name) ?: error("Cannot create directory $name")
+        findFile(name) ?: createDirectory(name) ?: throw IOException("Cannot create directory $name")
 }
 
 fun DocumentFile.countBytes(): Long {
