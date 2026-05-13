@@ -14,8 +14,10 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
@@ -48,56 +50,43 @@ jobs:
           echo "Resolved version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-java@v4
+  build-sign:
+    needs: version
+    uses: ./.github/workflows/_build-sign.yml
+    secrets: inherit
+
+  release:
+    needs: [version, build-sign]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
         with:
-          distribution: temurin
-          java-version: 17
+          fetch-depth: 0
 
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Decode signing keystore
-        run: |
-          echo "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" | base64 -d > "${{ runner.temp }}/release.keystore"
-
-      - name: Build signed release APK
-        env:
-          SIGNING_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
-          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-release
 
       - name: Rename APK
         id: rename
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          SIGNED_APK="app/build/outputs/apk/release/app-release.apk"
-          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
-          if [ -f "$SIGNED_APK" ]; then
-            APK_SOURCE="$SIGNED_APK"
-          elif [ -f "$UNSIGNED_APK" ]; then
-            echo "::error::Build produced an unsigned APK. Please configure signing secrets (SIGNING_KEYSTORE_BASE64, SIGNING_KEYSTORE_PASSWORD, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD)."
-            exit 1
-          else
-            echo "::error::No APK found at expected paths."
-            exit 1
-          fi
-          DEST="app/build/outputs/apk/release/keytester-${VERSION}.apk"
-          mv "$APK_SOURCE" "$DEST"
+          VERSION="${{ needs.version.outputs.version }}"
+          DEST="usbcopy-${VERSION}.apk"
+          mv app-release.apk "$DEST"
           echo "apk_path=$DEST" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ needs.version.outputs.version }}"
           git tag "$VERSION"
           git push origin "$VERSION"
 
-      - name: Create GitHub release draft
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.version.outputs.version }}
+          name: ${{ needs.version.outputs.version }}
           draft: true
           generate_release_notes: true
-          files: |
-            ${{ steps.rename.outputs.apk_path }}
+          files: ${{ steps.rename.outputs.apk_path }}
